@@ -9,4 +9,6 @@ require (
 	golang.org/x/crypto v0.23.0
 )
 
+require github.com/twmb/franz-go/pkg/kfake v0.0.0-20240710015325-a5f2b710830e // indirect
+
 retract v1.11.4 // This version is actually a breaking change and requires a major version change.

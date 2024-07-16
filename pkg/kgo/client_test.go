@@ -2,12 +2,19 @@ package kgo
 
 import (
 	"context"
+	"errors"
+	"math/rand/v2"
 	"reflect"
 	"strconv"
+	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/twmb/franz-go/pkg/kmsg"
+
+	"github.com/twmb/franz-go/pkg/kfake"
 )
 
 func TestMaxVersions(t *testing.T) {
@@ -213,4 +220,94 @@ type intSliceHook []int
 
 func (*intSliceHook) OnNewClient(*Client) {
 	// ignore
+}
+
+func TestClient_Produce(t *testing.T) {
+	const (
+		topicName     = "test"
+		numPartitions = 1
+		numWorkers    = 50
+		testDuration  = 3 * time.Second
+	)
+
+	var (
+		done    = make(chan struct{})
+		workers = sync.WaitGroup{}
+
+		writeSuccessCount = &atomic.Int64{}
+		writeFailureCount = &atomic.Int64{}
+	)
+
+	createRandomRecord := func() *Record {
+		return &Record{
+			Key:   []byte("test"),
+			Value: []byte(strings.Repeat("x", rand.IntN(1000))),
+			Topic: topicName,
+		}
+	}
+
+	// If the test is successful (no WriteSync() request is in a deadlock state) then we expect the test
+	// to complete shortly after the estimated test duration.
+	ctx, cancel := context.WithTimeoutCause(context.Background(), 2*testDuration, errors.New("test did not complete within the expected time"))
+	t.Cleanup(cancel)
+
+	// Create fake cluster.
+	cluster, err := kfake.NewCluster(kfake.NumBrokers(1), kfake.SeedTopics(numPartitions, topicName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(cluster.Close)
+
+	// Throttle a very short (random) time to increase chances of hitting race conditions.
+	cluster.ControlKey(int16(kmsg.Produce), func(_ kmsg.Request) (kmsg.Response, error, bool) {
+		time.Sleep(time.Duration(rand.Int64N(int64(time.Millisecond))))
+
+		return nil, nil, false
+	})
+
+	client, err := NewClient(
+		SeedBrokers(cluster.ListenAddrs()[0]),
+		MaxBufferedBytes(5000),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Start N workers that will concurrently write to the same partition.
+	for i := 0; i < numWorkers; i++ {
+		workers.Add(1)
+
+		go func() {
+			defer workers.Done()
+
+			for {
+				select {
+				case <-done:
+					return
+
+				default:
+					res := client.ProduceSync(ctx, createRandomRecord())
+					if err := res.FirstErr(); err == nil {
+						writeSuccessCount.Add(1)
+					} else {
+						if !errors.Is(err, ErrMaxBuffered) {
+							t.Fatalf("unexpected error: %v", err)
+						}
+
+						writeFailureCount.Add(1)
+					}
+				}
+			}
+		}()
+	}
+
+	// Keep it running for some time.
+	time.Sleep(testDuration)
+
+	// Signal workers to stop and wait until they're done.
+	close(done)
+	workers.Wait()
+
+	t.Logf("writes succeeded: %d", writeSuccessCount.Load())
+	t.Logf("writes failed:    %d", writeFailureCount.Load())
 }
