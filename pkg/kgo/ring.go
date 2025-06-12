@@ -41,15 +41,9 @@ const (
 )
 
 type ringReq struct {
-	mu sync.Mutex
-	c  *sync.Cond
-
-	elems [eight]promisedReq
-
-	head uint8
-	tail uint8
-	l    uint8
-	dead bool
+	mu    sync.Mutex
+	elems []promisedReq
+	dead  bool
 }
 
 func (r *ringReq) die() {
@@ -57,48 +51,40 @@ func (r *ringReq) die() {
 	defer r.mu.Unlock()
 
 	r.dead = true
-	if r.c != nil {
-		r.c.Broadcast()
-	}
 }
 
 func (r *ringReq) push(pr promisedReq) (first, dead bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	for r.l == eight && !r.dead {
-		if r.c == nil {
-			r.c = sync.NewCond(&r.mu)
-		}
-		r.c.Wait()
-	}
-
 	if r.dead {
 		return false, true
 	}
 
-	r.elems[r.tail] = pr
-	r.tail = (r.tail + 1) & mask7
-	r.l++
+	r.elems = append(r.elems, pr)
+	first = len(r.elems) == 1
 
-	return r.l == 1, false
+	return first, false
 }
 
 func (r *ringReq) dropPeek() (next promisedReq, more, dead bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	r.elems[r.head] = promisedReq{}
-	r.head = (r.head + 1) & mask7
-	r.l--
-
-	// If the cond has been initialized, there could potentially be waiters
-	// and we must always signal.
-	if r.c != nil {
-		r.c.Signal()
+	if len(r.elems) == 0 {
+		return promisedReq{}, false, r.dead
 	}
 
-	return r.elems[r.head], r.l > 0, r.dead
+	// Drop the first
+	r.elems[0] = promisedReq{}
+	r.elems = r.elems[1:]
+
+	// Peek at the new head
+	if len(r.elems) == 0 {
+		return promisedReq{}, false, r.dead
+	}
+
+	return r.elems[0], true, r.dead
 }
 
 // ringResp duplicates the code above, but for promisedResp
@@ -162,49 +148,41 @@ func (r *ringResp) dropPeek() (next promisedResp, more, dead bool) {
 }
 
 // ringSeqResp duplicates the code above, but for *seqResp. We leave off die
-// because we do not use it, but we keep `c` for testing lowering eight/mask7.
+// because we do not use it.
 type ringSeqResp struct {
-	mu sync.Mutex
-	c  *sync.Cond
-
-	elems [eight]*seqResp
-
-	head uint8
-	tail uint8
-	l    uint8
+	mu    sync.Mutex
+	queue []*seqResp
 }
 
 func (r *ringSeqResp) push(sr *seqResp) (first bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	for r.l == eight {
-		if r.c == nil {
-			r.c = sync.NewCond(&r.mu)
-		}
-		r.c.Wait()
-	}
+	r.queue = append(r.queue, sr)
+	first = len(r.queue) == 1
 
-	r.elems[r.tail] = sr
-	r.tail = (r.tail + 1) & mask7
-	r.l++
-
-	return r.l == 1
+	return first
 }
 
 func (r *ringSeqResp) dropPeek() (next *seqResp, more bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	r.elems[r.head] = nil
-	r.head = (r.head + 1) & mask7
-	r.l--
-
-	if r.c != nil {
-		r.c.Signal()
+	if len(r.queue) == 0 {
+		return nil, false
 	}
 
-	return r.elems[r.head], r.l > 0
+	// Drop the first
+	r.queue[0] = nil
+	r.queue = r.queue[1:]
+
+	// Peek at the new head
+	if len(r.queue) > 0 {
+		next = r.queue[0]
+		more = true
+	}
+
+	return next, more
 }
 
 // Also no die; this type is slightly different because we can have overflow.
